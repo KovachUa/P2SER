@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  build-amd64:
+    image: golang:alpine
+    volumes:
+      - .:/app
+    working_dir: /app
+    environment:
+      - CGO_ENABLED=0
+      - GOOS=linux
+      - GOARCH=amd64
+    command: sh -c "mkdir -p build && go build -o build/p2ser-amd64 ./cmd/p2ser"
+
+  build-arm64:
+    image: golang:alpine
+    volumes:
+      - .:/app
+    working_dir: /app
+    environment:
+      - CGO_ENABLED=0
+      - GOOS=linux
+      - GOARCH=arm64
+    command: sh -c "mkdir -p build && go build -o build/p2ser-arm64 ./cmd/p2ser"

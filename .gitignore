@@ -1,0 +1,35 @@
+# Config with secrets
+backend/config.yaml
+config.yaml
+
+# Build artifacts
+backend/p2ser
+backend/p2ser_test_build
+backend/build/
+backend/p2ser-data/
+
+# Logs
+*.log
+p2ser_live.log
+
+# Node modules
+ui/node_modules/
+ui/dist/
+
+# Go
+backend/vendor/
+*.test
+
+# Temp
+*.tmp
+/tmp/p2ser_*
+
+# SSH keys & secrets
+backend/githome_ssh_keys/
+backend/yhtv_pgdata/
+
+# Raft data
+backend/p2ser-data/
+
+# WireGuard keys
+/tmp/p2ser_wg_*
