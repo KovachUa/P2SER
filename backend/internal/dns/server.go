@@ -2,8 +2,10 @@ package dns
 
 import (
 	"log"
+	"math/rand"
 	"strings"
 
+	"github.com/kovach/p2ser/internal/config"
 	"github.com/kovach/p2ser/internal/scheduler"
 	"github.com/miekg/dns"
 )
@@ -31,17 +33,21 @@ func (s *Server) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 			// Перевіряємо, чи це внутрішній сервіс
 			pods, err := s.scheduler.FetchPods()
 			if err == nil {
+				var candidates []string
 				for _, pod := range pods {
-					// Nginx та інші сервіси можуть шукати "backend"
-					if pod.App == name && pod.PodIP != "" {
-						internalIP = strings.Split(pod.PodIP, "/")[0]
-						break
+					// H-14: Фільтруємо лише запущені та готові контейнери (readiness probe passed)
+					if pod.Status != "Running" || !pod.Ready {
+						continue
 					}
-					// Або повне ім'я "backend-active-0"
-					if pod.ID == name && pod.PodIP != "" {
-						internalIP = strings.Split(pod.PodIP, "/")[0]
-						break
+					
+					// Nginx та інші сервіси можуть шукати "backend" або повне ім'я "backend-active-0"
+					if (pod.App == name || pod.ID == name) && pod.PodIP != "" {
+						candidates = append(candidates, strings.Split(pod.PodIP, "/")[0])
 					}
+				}
+				if len(candidates) > 0 {
+					// H-14: Load-balance across multiple replicas (random choice)
+					internalIP = candidates[rand.Intn(len(candidates))]
 				}
 			}
 		}
@@ -57,9 +63,13 @@ func (s *Server) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 			return
 		}
 
-		// Якщо не знайшли внутрішній IP, форвардимо запит до 8.8.8.8
+		// Якщо не знайшли внутрішній IP, форвардимо запит
+		upstreamDNS := "1.1.1.1"
+		if config.GlobalConfig != nil && config.GlobalConfig.UpstreamDNS != "" {
+			upstreamDNS = config.GlobalConfig.UpstreamDNS
+		}
 		c := new(dns.Client)
-		in, _, err := c.Exchange(r, "8.8.8.8:53")
+		in, _, err := c.Exchange(r, upstreamDNS+":53")
 		if err == nil && in != nil {
 			w.WriteMsg(in)
 			return

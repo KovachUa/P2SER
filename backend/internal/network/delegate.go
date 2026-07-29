@@ -29,6 +29,7 @@ type MyDelegate struct {
 	Meta         NodeMetadata
 	Broadcasts   *memberlist.TransmitLimitedQueue
 	nodeVersions map[string]int64 // 1.3.3: Зберігання останньої відомої версії для кожного вузла
+	NetManager   *NetworkManager
 }
 
 func (d *MyDelegate) NodeMeta(limit int) []byte {
@@ -55,6 +56,9 @@ func (d *MyDelegate) NotifyMsg(b []byte) {
 
 		// Оновлюємо версію та обробляємо дані
 		d.nodeVersions[metrics.Node] = metrics.Version
+		if d.NetManager != nil {
+			d.NetManager.UpdateNodeMetrics(metrics)
+		}
 		log.Printf("Gossip: Отримано метрики від [%s] (v%d) -> CPU: %.1f%%, RAM: %d MB", metrics.Node, metrics.Version, metrics.CPUUsage, metrics.RAMFree)
 	}
 }

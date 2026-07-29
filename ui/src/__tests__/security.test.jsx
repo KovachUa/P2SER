@@ -38,7 +38,7 @@ describe('Security: No hardcoded tokens', () => {
     expect(matches).toBeNull()
   })
 
-  it('should read API token from localStorage', () => {
+  it('should read API token from localStorage and send it via Authorization header', () => {
     localStorage.setItem('p2ser_api_token', 'my-test-token-123')
     
     render(<App />)
@@ -47,9 +47,10 @@ describe('Security: No hardcoded tokens', () => {
     const fetchCalls = fetch.mock.calls
     expect(fetchCalls.length).toBeGreaterThan(0)
     
-    const hasCorrectToken = fetchCalls.some(call =>
-      call[0].includes('token=my-test-token-123')
-    )
+    const hasCorrectToken = fetchCalls.some(call => {
+      const options = call[1]
+      return options && options.headers && options.headers['Authorization'] === 'Bearer my-test-token-123'
+    })
     expect(hasCorrectToken).toBe(true)
   })
 

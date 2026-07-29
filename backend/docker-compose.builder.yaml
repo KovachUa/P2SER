@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   build-amd64:
-    image: golang:alpine
+    image: golang:1.22-alpine
     volumes:
       - .:/app
     working_dir: /app
@@ -13,7 +13,7 @@ services:
     command: sh -c "mkdir -p build && go build -o build/p2ser-amd64 ./cmd/p2ser"
 
   build-arm64:
-    image: golang:alpine
+    image: golang:1.22-alpine
     volumes:
       - .:/app
     working_dir: /app

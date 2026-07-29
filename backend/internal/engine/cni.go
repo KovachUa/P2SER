@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+
+	"github.com/kovach/p2ser/internal/config"
 )
 
 // EnsureCNIPlugins завантажує CNI плагіни, якщо їх немає (поведінка як у k3s)
@@ -21,6 +23,7 @@ func EnsureCNIPlugins() error {
 	cmd := exec.Command("bash", "-c", fmt.Sprintf(`
 		cd /tmp &&
 		wget -qO cni.tgz https://github.com/containernetworking/plugins/releases/download/v1.3.0/cni-plugins-linux-amd64-v1.3.0.tgz &&
+		echo "754a71ed60a4bd08726c3af705a7d55ee3df03122b12e389fdba4bea35d7dd7e  cni.tgz" | sha256sum -c - &&
 		tar -C %s -xzf cni.tgz &&
 		rm cni.tgz
 	`, cniDir))
@@ -37,20 +40,31 @@ func EnsureCNIPlugins() error {
 func SetupCNINetwork(containerID, netnsPath string) (string, error) {
 	cniDir := "/opt/p2ser/cni/bin"
 
-	config := []byte(`{
+	bridgeName := "p2ser0"
+	podSubnet := "10.88.0.0/16"
+	if config.GlobalConfig != nil {
+		if config.GlobalConfig.BridgeName != "" {
+			bridgeName = config.GlobalConfig.BridgeName
+		}
+		if config.GlobalConfig.PodSubnet != "" {
+			podSubnet = config.GlobalConfig.PodSubnet
+		}
+	}
+
+	cniConf := []byte(fmt.Sprintf(`{
 		"cniVersion": "1.0.0",
 		"name": "p2ser-net",
 		"type": "bridge",
-		"bridge": "p2ser0",
+		"bridge": "%s",
 		"isGateway": true,
 		"ipMasq": true,
 		"hairpinMode": true,
 		"ipam": {
 			"type": "host-local",
-			"subnet": "10.88.0.0/16",
+			"subnet": "%s",
 			"routes": [ { "dst": "0.0.0.0/0" } ]
 		}
-	}`)
+	}`, bridgeName, podSubnet))
 
 	cmd := exec.Command(filepath.Join(cniDir, "bridge"))
 	cmd.Env = []string{
@@ -61,7 +75,7 @@ func SetupCNINetwork(containerID, netnsPath string) (string, error) {
 		"CNI_PATH=" + cniDir,
 		"PATH=/sbin:/usr/sbin:/usr/local/sbin:/bin:/usr/bin:" + os.Getenv("PATH"),
 	}
-	cmd.Stdin = bytes.NewReader(config)
+	cmd.Stdin = bytes.NewReader(cniConf)
 	
 	out, err := cmd.CombinedOutput()
 	if err != nil {

@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -8,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/kovach/p2ser/internal/compose"
 	"github.com/kovach/p2ser/internal/scheduler"
@@ -57,23 +59,77 @@ func BuildAndLoad(projectPath string) ([]scheduler.Pod, error) {
 	projectName = strings.ReplaceAll(projectName, ".", "")
 	projectName = strings.ToLower(projectName)
 
-	// 3. Запускаємо збірку образів через docker compose
-	log.Printf("Builder: Запускаю 'docker compose build'...")
-	cmdBuild := exec.Command("docker", "compose", "-p", projectName, "build")
-	cmdBuild.Dir = projectPath
-	cmdBuild.Stdout = os.Stdout
-	cmdBuild.Stderr = os.Stderr
-	if err := cmdBuild.Run(); err != nil {
-		return nil, fmt.Errorf("помилка збірки образів: %v", err)
+	// 3. Парсимо docker-compose.yml для визначення необхідності збірки
+	var composeFile struct {
+		Services map[string]struct {
+			Image string      `yaml:"image"`
+			Build interface{} `yaml:"build"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(composeData, &composeFile); err != nil {
+		return nil, fmt.Errorf("помилка попереднього парсингу compose-файлу: %v", err)
 	}
 
-	// 4. Парсимо docker-compose з підстановкою змінних з .env
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	// 4. Ізольована збірка образів (C-14)
+	for name, svc := range composeFile.Services {
+		if svc.Build != nil {
+			log.Printf("Builder: Збірка образу для сервісу %s...", name)
+			buildCtx := "."
+			dockerfile := "Dockerfile"
+
+			switch b := svc.Build.(type) {
+			case string:
+				buildCtx = b
+			case map[interface{}]interface{}:
+				if ctxStr, ok := b["context"].(string); ok {
+					buildCtx = ctxStr
+				}
+				if dfStr, ok := b["dockerfile"].(string); ok {
+					dockerfile = dfStr
+				}
+			case map[string]interface{}:
+				if ctxStr, ok := b["context"].(string); ok {
+					buildCtx = ctxStr
+				}
+				if dfStr, ok := b["dockerfile"].(string); ok {
+					dockerfile = dfStr
+				}
+			}
+
+			imgName := svc.Image
+			if imgName == "" {
+				imgName = fmt.Sprintf("%s-%s", projectName, name)
+			}
+
+			args := []string{
+				"build",
+				"-t", imgName,
+				"-f", filepath.Join(projectPath, buildCtx, dockerfile),
+				"--network=none", // C-14: No network access during build
+				"--memory=1g",    // C-14: Memory limit
+				filepath.Join(projectPath, buildCtx),
+			}
+			
+			cmdBuild := exec.CommandContext(ctx, "docker", args...)
+			cmdBuild.Dir = projectPath
+			cmdBuild.Stdout = os.Stdout
+			cmdBuild.Stderr = os.Stderr
+			if err := cmdBuild.Run(); err != nil {
+				return nil, fmt.Errorf("помилка ізольованої збірки для %s: %v", name, err)
+			}
+		}
+	}
+
+	// 5. Парсимо docker-compose з підстановкою змінних з .env для планувальника
 	pods, err := compose.ParseComposeFile(projectName, composeData, envMap, projectPath)
 	if err != nil {
 		return nil, fmt.Errorf("помилка парсингу compose-файлу: %v", err)
 	}
 
-	// 5. Автоматично імпортуємо всі образи в containerd кластера P2SER
+	// 6. Автоматично імпортуємо всі образи в containerd кластера P2SER
 	for _, pod := range pods {
 		if pod.Image == "" {
 			continue
@@ -89,7 +145,8 @@ func BuildAndLoad(projectPath string) ([]scheduler.Pod, error) {
 		}
 
 		cmdSave := exec.Command("docker", "save", imageName)
-		cmdImport := exec.Command("sudo", "ctr", "-n", "p2ser", "images", "import", "-") // sudo потрібен якщо P2SER не від root
+		// C-14: Видалено sudo. Вузол має запускатися з необхідними правами (узгоджено з H-11)
+		cmdImport := exec.Command("ctr", "-n", "p2ser", "images", "import", "-") 
 		
 		pipe, err := cmdSave.StdoutPipe()
 		if err != nil {

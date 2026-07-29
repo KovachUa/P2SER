@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/exec"
@@ -49,27 +50,55 @@ func sanitizeLog(s string) string {
 
 // APIServer обслуговує запити до кластера (Пункт 2.3 та 2.4.2)
 type APIServer struct {
-	raftNode   *raft.Raft
-	fsm        *cluster.FSM
-	netManager *network.NetworkManager
-	apiToken   string
-	cm         *engine.ContainerManager
+	raftNode    *raft.Raft
+	fsm         *cluster.FSM
+	netManager  *network.NetworkManager
+	apiToken    string
+	cm          *engine.ContainerManager
+	localNodeID string
+	wsTickets   sync.Map // Зберігає одноразові тікети для WebSocket (H-12)
 }
 
-func NewAPIServer(raftNode *raft.Raft, fsm *cluster.FSM, netManager *network.NetworkManager, apiToken string, cm *engine.ContainerManager) *APIServer {
+func NewAPIServer(raftNode *raft.Raft, fsm *cluster.FSM, netManager *network.NetworkManager, apiToken string, cm *engine.ContainerManager, localNodeID string) *APIServer {
 	return &APIServer{
-		raftNode:   raftNode,
-		fsm:        fsm,
-		netManager: netManager,
-		apiToken:   apiToken,
-		cm:         cm,
+		raftNode:    raftNode,
+		fsm:         fsm,
+		netManager:  netManager,
+		apiToken:    apiToken,
+		cm:          cm,
+		localNodeID: localNodeID,
 	}
+}
+
+// forwardToLeader proxies the request to the cluster leader if the current node is a Follower.
+// Returns true if the request was proxied (and handled), false if the current node is the Leader.
+func (s *APIServer) forwardToLeader(w http.ResponseWriter, r *http.Request) bool {
+	if s.raftNode.State() == raft.Leader {
+		return false
+	}
+
+	leaderAddr := s.raftNode.Leader()
+	if leaderAddr == "" {
+		http.Error(w, "Leader not found (cluster election in progress)", http.StatusServiceUnavailable)
+		return true
+	}
+
+	log.Printf("API: Вузол є Follower. Проксіювання запиту до лідера %s", leaderAddr)
+
+	targetURL, _ := url.Parse("http://" + string(leaderAddr))
+	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	proxy.ServeHTTP(w, r)
+	return true
 }
 
 // HandleApply відповідає за обробку команд на зміну стану (Пункт 2.3.2 та 2.3.3)
 func (s *APIServer) HandleApply(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.forwardToLeader(w, r) {
 		return
 	}
 
@@ -81,38 +110,6 @@ func (s *APIServer) HandleApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-
-	// 2.3.1 та 2.3.2: Маршрутизація записів (Write Forwarding)
-	// Якщо ми не лідер, невидимо проксіюємо запит до лідера
-	if s.raftNode.State() != raft.Leader {
-		leaderAddr := s.raftNode.Leader()
-		if leaderAddr == "" {
-			http.Error(w, "Leader not found (cluster election in progress)", http.StatusServiceUnavailable)
-			return
-		}
-
-		log.Printf("API: Вузол є Follower. Проксіювання запиту до лідера %s", leaderAddr)
-
-		// Оскільки HTTP та Raft ділять один порт через cmux, ми можемо звернутися прямо по адресі лідера
-		proxyReq, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/apply", leaderAddr), bytes.NewBuffer(body))
-		if err != nil {
-			http.Error(w, "Failed to create proxy request", http.StatusInternalServerError)
-			return
-		}
-
-		client := &http.Client{Timeout: 5 * time.Second}
-		resp, err := client.Do(proxyReq)
-		if err != nil {
-			http.Error(w, "Proxy failed", http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close()
-
-		// Повертаємо відповідь від лідера клієнту
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
-		return
-	}
 
 	// 2.3.3: Команди ідемпотентні (наприклад, "set"), тому подвійне виконання безпечне
 	// Якщо ми лідер, застосовуємо команду до Raft логу
@@ -130,6 +127,11 @@ func (s *APIServer) HandleApply(w http.ResponseWriter, r *http.Request) {
 func (s *APIServer) HandleUploadSource(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// M-9: Write-forwarding for deploy handlers
+	if s.forwardToLeader(w, r) {
 		return
 	}
 
@@ -215,6 +217,11 @@ func (s *APIServer) HandleDeployGit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// M-9: Write-forwarding for deploy handlers
+	if s.forwardToLeader(w, r) {
+		return
+	}
+
 	var reqData struct {
 		URL    string            `json:"url"`
 		Branch string            `json:"branch"`
@@ -228,7 +235,8 @@ func (s *APIServer) HandleDeployGit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// H-4: Validate Git URL — allow only https/git schemes, block private IPs
-	if err := validateGitURL(reqData.URL); err != nil {
+	host, ip, err := validateGitURL(reqData.URL)
+	if err != nil {
 		http.Error(w, fmt.Sprintf("Invalid Git URL: %v", err), http.StatusBadRequest)
 		return
 	}
@@ -244,8 +252,15 @@ func (s *APIServer) HandleDeployGit(w http.ResponseWriter, r *http.Request) {
 	os.MkdirAll(tmpDir, 0755)
 	defer os.RemoveAll(tmpDir) // L-4: always clean up temp dirs
 
+	proxyURL, cleanup, err := runCloneProxy(host, ip)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Помилка створення proxy: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer cleanup()
+
 	// 1. Клонуємо репозиторій
-	args := []string{"clone", "--depth=1"}
+	args := []string{"-c", "http.proxy=" + proxyURL, "clone", "--depth=1"}
 	if reqData.Branch != "" {
 		args = append(args, "-b", reqData.Branch)
 	}
@@ -382,30 +397,28 @@ func (s *APIServer) HandleNodes(w http.ResponseWriter, r *http.Request) {
 		role := "Follower"
 		if srv.Address == leaderAddr {
 			role = "Leader"
-		} else if s.raftNode.State() == raft.Leader && string(srv.ID) == s.raftNode.String() {
+		} else if s.raftNode.State() == raft.Leader && string(srv.ID) == s.localNodeID {
 			role = "Leader"
 		}
 
-		// Генерація фейкових метрик для прототипу (замість реального memberlist-gossip)
-		seed := int64(0)
-		for _, char := range string(srv.ID) {
-			seed += int64(char)
-		}
-		rand.Seed(time.Now().Unix() + seed)
-
-		baseCpu := 10 + rand.Intn(30)
-		baseRam := 20 + rand.Intn(40)
-		if role == "Leader" {
-			baseCpu += 20 // Лідер трохи більше навантажений
-			baseRam += 15
+		cpuUsage := 0
+		ramUsage := 0
+		
+		if s.netManager != nil {
+			if metrics, ok := s.netManager.GetNodeMetrics(string(srv.ID)); ok {
+				cpuUsage = int(metrics.CPUUsage)
+				ramUsage = 100 - int(metrics.RAMFree*100/2048) // Approximation since we mock 2GB total in delegate
+				if ramUsage < 0 { ramUsage = 0 }
+				if ramUsage > 100 { ramUsage = 100 }
+			}
 		}
 
 		nodes = append(nodes, NodeInfo{
 			ID:       string(srv.ID),
 			Address:  string(srv.Address),
 			Role:     role,
-			CpuUsage: baseCpu + rand.Intn(10) - 5,
-			RamUsage: baseRam + rand.Intn(10) - 5,
+			CpuUsage: cpuUsage,
+			RamUsage: ramUsage,
 		})
 	}
 
@@ -420,6 +433,10 @@ func (s *APIServer) HandleCompose(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.forwardToLeader(w, r) {
+		return
+	}
+
 	// H-2: limit body size to prevent memory exhaustion
 	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10 MB for compose files
 	body, err := io.ReadAll(r.Body)
@@ -428,28 +445,6 @@ func (s *APIServer) HandleCompose(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-
-	// Якщо ми не лідер, проксіюємо запит до лідера
-	if s.raftNode.State() != raft.Leader {
-		leaderAddr := s.raftNode.Leader()
-		if leaderAddr == "" {
-			http.Error(w, "Leader not found", http.StatusServiceUnavailable)
-			return
-		}
-
-		proxyReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/compose", leaderAddr), bytes.NewBuffer(body))
-		client := &http.Client{Timeout: 5 * time.Second}
-		resp, err := client.Do(proxyReq)
-		if err != nil {
-			http.Error(w, "Proxy failed", http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close()
-
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
-		return
-	}
 
 	projectName := r.Header.Get("X-Project-Name")
 	if projectName == "" {
@@ -514,7 +509,12 @@ func (s *APIServer) HandleCompose(w http.ResponseWriter, r *http.Request) {
 					"value": string(oldPodBytes),
 				}
 				cmdOldBytes, _ := json.Marshal(cmdOld)
-				s.raftNode.Apply(cmdOldBytes, 5*time.Second)
+				applyFutureOld := s.raftNode.Apply(cmdOldBytes, 5*time.Second)
+				if err := applyFutureOld.Error(); err != nil {
+					log.Printf("API: Помилка збереження старого Pod %s (Rolling Update): %v", oldPod.ID, err)
+					http.Error(w, fmt.Sprintf("Failed to apply old pod update: %v", err), http.StatusInternalServerError)
+					return
+				}
 			} else {
 				// Якщо образ не змінився, оновлюємо поточний (але зберігаємо ID і Status, щоб не перезапустити)
 				newPod.ID = oldPod.ID
@@ -623,7 +623,8 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 }
 
 
-// BotProtectionMiddleware перевіряє User-Agent на наявність відомих ботів, сканерів та LLM-парсерів
+// BotProtectionMiddleware перевіряє User-Agent на наявність відомих ботів та сканерів.
+// M-12 SECURITY NOTE: This is for crawler/noise filtering only. Do NOT rely on it as an access control mechanism, as User-Agent is trivially spoofed.
 func BotProtectionMiddleware(netManager *network.NetworkManager, fsm *cluster.FSM, next http.Handler) http.Handler {
 	// Список відомих шкідливих сканерів та AI-ботів (в нижньому регістрі)
 	defaultBots := []string{
@@ -675,6 +676,12 @@ func (s *APIServer) HandleGetLogs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "id parameter required", http.StatusBadRequest)
 		return
 	}
+	
+	// H-10: validate podID to prevent path traversal
+	if !validPodID.MatchString(podID) {
+		http.Error(w, "Invalid pod id", http.StatusBadRequest)
+		return
+	}
 
 	logPath := "/tmp/p2ser_" + podID + ".log"
 	data, err := os.ReadFile(logPath)
@@ -696,7 +703,7 @@ func (s *APIServer) HandleGetLogs(w http.ResponseWriter, r *http.Request) {
 
 // AuthMiddleware перевіряє наявність правильного токена у запиті (Bearer або query)
 // C-5: використовуємо constant-time comparison щоб уникнути timing side-channel
-func AuthMiddleware(apiToken string, next http.Handler) http.Handler {
+func (s *APIServer) AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Пропускаємо CORS preflight
 		if r.Method == "OPTIONS" {
@@ -708,12 +715,23 @@ func AuthMiddleware(apiToken string, next http.Handler) http.Handler {
 		reqToken := r.Header.Get("Authorization")
 		if reqToken != "" {
 			reqToken = strings.TrimPrefix(reqToken, "Bearer ")
-		} else {
-			reqToken = r.URL.Query().Get("token")
+		}
+
+		// H-12: WebSocket ticket authentication
+		if r.Header.Get("Upgrade") == "websocket" {
+			ticket := r.URL.Query().Get("ticket")
+			if ticket != "" {
+				if expiry, ok := s.wsTickets.LoadAndDelete(ticket); ok {
+					if time.Now().Before(expiry.(time.Time)) {
+						next.ServeHTTP(w, r)
+						return
+					}
+				}
+			}
 		}
 
 		// C-5: constant-time comparison to prevent timing attacks
-		if subtle.ConstantTimeCompare([]byte(reqToken), []byte(apiToken)) != 1 {
+		if subtle.ConstantTimeCompare([]byte(reqToken), []byte(s.apiToken)) != 1 {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -823,9 +841,10 @@ func (s *APIServer) HandleStats(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"cpu": fmt.Sprintf("%s", loadAvg),
-		"ram_used": fmt.Sprintf("%.1f GB", usedGB),
-		"ram_total": fmt.Sprintf("%.1f GB", totalGB),
+		"cpu":          fmt.Sprintf("%s", loadAvg),
+		"ram_used":     fmt.Sprintf("%.1f GB", usedGB),
+		"ram_total":    fmt.Sprintf("%.1f GB", totalGB),
+		"geo_ip_error": s.netManager.GetGeoIPError(),
 	})
 }
 
@@ -940,7 +959,7 @@ func (s *APIServer) HandleExecPod(w http.ResponseWriter, r *http.Request) {
 	var pod scheduler.Pod
 	json.Unmarshal([]byte(podDataStr), &pod)
 
-	localNode := s.raftNode.String() // string ID
+	localNode := s.localNodeID // string ID
 	if pod.NodeID != localNode {
 		// ПРОКСІЮВАННЯ НА ВУЗОЛ, ДЕ ЗАПУЩЕНО POD
 		future := s.raftNode.GetConfiguration()
@@ -960,8 +979,10 @@ func (s *APIServer) HandleExecPod(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		wsURL := fmt.Sprintf("ws://%s/pod/exec?id=%s&token=%s", targetAddr, podID, s.apiToken)
-		targetConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		wsURL := fmt.Sprintf("ws://%s/pod/exec?id=%s", targetAddr, podID)
+		headers := http.Header{}
+		headers.Add("Authorization", "Bearer "+s.apiToken)
+		targetConn, _, err := websocket.DefaultDialer.Dial(wsURL, headers)
 		if err != nil {
 			conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("Proxy failed: %v\r\n", err)))
 			return
@@ -1148,13 +1169,14 @@ func (s *APIServer) ServeWithUI(listener net.Listener, uiFS http.FileSystem, all
 	apiMux.HandleFunc("/stats", s.HandleStats)
 	apiMux.HandleFunc("/ban", s.HandleBan)
 	apiMux.HandleFunc("/bot", s.HandleManageBot)
+	apiMux.HandleFunc("/ticket", s.HandleGetWsTicket) // H-12
 
 	// Захищений API (токен обов'язковий)
 	protectedAPI := CORSMiddleware(allowedOrigin,
 		LoggingMiddleware(
 			RateLimitMiddleware(s.netManager,
 				BotProtectionMiddleware(s.netManager, s.fsm,
-					AuthMiddleware(s.apiToken, apiMux)))))
+					s.AuthMiddleware(apiMux)))))
 
 	rootMux := http.NewServeMux()
 
@@ -1223,6 +1245,26 @@ func (s *APIServer) ServeWithUI(listener net.Listener, uiFS http.FileSystem, all
 		IdleTimeout:       120 * time.Second,
 	}
 	return server.Serve(listener)
+}
+
+// HandleGetWsTicket видає одноразовий квиток для доступу по WebSocket (H-12)
+func (s *APIServer) HandleGetWsTicket(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	ticketBytes := make([]byte, 16)
+	if _, err := rand.Read(ticketBytes); err != nil {
+		http.Error(w, "Failed to generate ticket", http.StatusInternalServerError)
+		return
+	}
+	ticket := fmt.Sprintf("%x", ticketBytes)
+	
+	s.wsTickets.Store(ticket, time.Now().Add(1*time.Minute))
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"ticket": ticket})
 }
 
 // safeUnzip extracts a ZIP archive safely, preventing Zip Slip attacks (H-1).

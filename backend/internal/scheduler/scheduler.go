@@ -75,10 +75,12 @@ type Pod struct {
 
 // Scheduler відповідає за децентралізоване планування (Розділ 3)
 type Scheduler struct {
-	nodeID   string
-	apiAddr  string // локальний API сервер або адреса лідера
-	meta     network.NodeMetadata
-	apiToken string
+	nodeID           string
+	apiAddr          string
+	apiToken         string
+	meta             network.NodeMetadata
+	ContainerChecker func(ctx context.Context, id string) (bool, error)
+	IsNodeAlive      func(nodeID string) bool
 }
 
 func NewScheduler(nodeID, apiAddr string, meta network.NodeMetadata, apiToken string) *Scheduler {
@@ -274,8 +276,18 @@ func (s *Scheduler) reconcileStandby(allPods []Pod, now int64) {
 			for _, otherPod := range allPods {
 				if otherPod.App == localPod.App && otherPod.Role == "Active" {
 					isExpired := otherPod.LeaseExpiresAt > 0 && otherPod.LeaseExpiresAt < now
-					if isExpired {
-						log.Printf("Warm Standby: Виявлено падіння Active репліки %s (App: %s).", otherPod.ID, otherPod.App)
+					
+					// C-11: Stronger death confirmation for Active pod before promotion
+					confirmedDead := isExpired
+					if confirmedDead && s.IsNodeAlive != nil {
+						if s.IsNodeAlive(otherPod.NodeID) && otherPod.Status != "Fenced" {
+							log.Printf("Warm Standby: Active %s прострочив оренду, але вузол %s живий. Скасування промоушена (Split-Brain protection).", otherPod.ID, otherPod.NodeID)
+							confirmedDead = false
+						}
+					}
+
+					if confirmedDead {
+						log.Printf("Warm Standby: Виявлено підтверджене падіння Active репліки %s (App: %s).", otherPod.ID, otherPod.App)
 						log.Printf("Warm Standby: Миттєво переводимо локальний Standby %s в Active-режим!", localPod.ID)
 
 						// Промоутимо себе в Active
@@ -338,6 +350,13 @@ func (s *Scheduler) renewLeases() {
 
 	for _, pod := range pods {
 		if pod.NodeID == s.nodeID && (pod.Status == "Scheduled" || pod.Status == "Running") {
+			// C-10: Check actual container state before renewing
+			if s.ContainerChecker != nil {
+				isRunning, _ := s.ContainerChecker(context.Background(), pod.ID)
+				if !isRunning {
+					continue
+				}
+			}
 			// Поновлюємо оренду на +15 секунд (Heartbeat)
 			s.tryLockPod(pod)
 		}

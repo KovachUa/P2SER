@@ -31,6 +31,8 @@ func DeployCompose(composePath string, apiEndpoint string, apiToken string) {
 	req.Header.Set("Content-Type", "application/x-yaml")
 	
 	absPath, _ := filepath.Abs(composePath)
+	// L-9: Попередження про те, що локальний шлях відправляється на віддалений сервер
+	fmt.Printf("Увага: Відносні шляхи до томів будуть базуватись на шляху %s на сервері. Це гарантовано працює лише якщо клієнт і сервер знаходяться на одній машині.\n", filepath.Dir(absPath))
 	req.Header.Set("X-Working-Dir", filepath.Dir(absPath))
 	
 	if apiToken != "" {

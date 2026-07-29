@@ -30,15 +30,17 @@ func InstallSystemdService() {
 Description=P2SER Edge Orchestrator
 After=network.target containerd.service
 
-[compose.Service]
+[Service]
 Type=simple
 ExecStart=%s start
+User=root
+Group=root
 WorkingDirectory=%s
 Restart=always
 RestartSec=5
 LimitNOFILE=65536
-LimitNPROC=infinity
-LimitCORE=infinity
+LimitNPROC=65536
+LimitCORE=0
 
 [Install]
 WantedBy=multi-user.target

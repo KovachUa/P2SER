@@ -15,7 +15,7 @@ Unlike heavy orchestrators like Kubernetes, P2SER natively understands your stan
 *   **Zero-Touch Deployment:** Single-token cluster initialization (`p2ser init`). Nodes discover each other automatically via mDNS or UDP Broadcast in LAN.
 *   **Built-in Web Dashboard:** Comes with a beautiful, cloud-like React UI for managing projects, deploying templates, and monitoring real-time metrics.
 *   **Advanced Networking:** Built-in IPAM, CNI integration, and VXLAN overlay networks for seamless Pod-to-Pod communication across different physical nodes.
-*   **Zero Trust Security:** Enforces mTLS encryption, encrypted state storage (`bbolt`), and container isolation (Rootless & eBPF). Includes a built-in Geo-IP filter.
+*   **Secure by Design:** Enforces AES symmetric encryption for Gossip (via bootstrap token), encrypted state storage (`bbolt`), and container isolation (Rootless & eBPF). Includes a built-in Geo-IP filter.
 
 ## 📦 How to Describe a Service
 
@@ -43,9 +43,9 @@ services:
    p2ser init 'MY_SECRET_TOKEN'
    ```
 2. **Join the Cluster (Other Nodes):**
-   Simply run the same command on other machines in the same LAN. They will automatically discover the leader via Multicast/mDNS and join.
+   Simply run the following command on other machines in the same LAN. They will automatically discover the leader via Multicast/mDNS and join.
    ```bash
-   p2ser init 'MY_SECRET_TOKEN'
+   p2ser start 'MY_SECRET_TOKEN'
    ```
 3. **Deploy an App:**
    ```bash

@@ -192,12 +192,27 @@ func main() {
 			VPSPubKey:   vpsPubKey,
 			VPSPrivKey:  vpsPrivKey,
 			VPSTunnelIP: vpsTunnelIP,
+			PodSubnet:   "10.88.0.0/16",
+			BridgeName:  "p2ser0",
+			UpstreamDNS: "1.1.1.1",
+			SanctionedCodes: []string{"RU", "BY", "KP", "IR", "SY"},
 		}
+		
 		if err := cfgPkg.SaveConfig(configPath, cfg); err != nil {
 			log.Fatalf("Помилка збереження config.yaml: %v", err)
 		}
 		fmt.Println("✓ Створено новий файл config.yaml")
 	} else {
+		// Якщо конфіг уже є, але L-11 поля порожні, ініціалізуємо їх
+		updated := false
+		if cfg.PodSubnet == "" { cfg.PodSubnet = "10.88.0.0/16"; updated = true }
+		if cfg.BridgeName == "" { cfg.BridgeName = "p2ser0"; updated = true }
+		if cfg.UpstreamDNS == "" { cfg.UpstreamDNS = "1.1.1.1"; updated = true }
+		if len(cfg.SanctionedCodes) == 0 { cfg.SanctionedCodes = []string{"RU", "BY", "KP", "IR", "SY"}; updated = true }
+		if updated {
+			cfgPkg.SaveConfig(configPath, cfg)
+		}
+		
 		token = cfg.Token
 		name = cfg.Name
 		port = cfg.Port
@@ -215,6 +230,7 @@ func main() {
 			_ = fs.Parse(os.Args[2:])
 		}
 	}
+	cfgPkg.GlobalConfig = cfg
 
 	var config *memberlist.Config
 	if edgeMode {
@@ -226,7 +242,7 @@ func main() {
 		config = memberlist.DefaultLANConfig()
 	}
 	
-	// 11.1: Шифрування Gossip-трафіку (mTLS/Симетричне)
+	// 11.1: Симетричне шифрування Gossip-трафіку (AES)
 	// Використовуємо хеш від Bootstrap Token як 32-байтний ключ AES-256-GCM
 	tokenHash := sha256.Sum256([]byte(cfg.Token))
 	config.SecretKey = tokenHash[:]
@@ -248,7 +264,8 @@ func main() {
 	}
 
 	// 4.1, 4.2, 4.3: Налаштування Network Manager
-	netManager := network.NewNetworkManager(config.Name, "127.0.0.1") // У реальності тут був би фізичний IP
+	localIP := getOutboundIP()
+	netManager := network.NewNetworkManager(config.Name, localIP)
 	localSubnet := netManager.SetupAllocateSubnet()
 	_ = netManager.GenerateCNIConfig()
 	netManager.SetupVXLAN()
@@ -271,6 +288,47 @@ func main() {
 			RaftPort: raftPort,    // Передаємо Raft TCP порт для автоматичного додавання
 		},
 		Broadcasts: broadcasts,
+		NetManager: netManager,
+	}
+
+	// 7.2: Георозподілені кластери (Federation)
+	var wanList *memberlist.Memberlist
+	var wanBroadcasts *memberlist.TransmitLimitedQueue
+	if joinAddr != "" {
+		// Створюємо окреме кільце WAN для об'єднання незалежних Raft-кластерів
+		wanConfig := memberlist.DefaultWANConfig()
+		wanConfig.SecretKey = tokenHash[:] // Застосовуємо шифрування і для WAN-кільця
+		if name != "" {
+			wanConfig.Name = name + "-wan"
+		} else {
+			wanConfig.Name = "wan-" + fmt.Sprintf("%d", time.Now().Unix())
+		}
+		wanConfig.BindPort = port + 1000 // Наприклад 9001, якщо LAN Gossip на 8001
+
+		wanBroadcasts = &memberlist.TransmitLimitedQueue{
+			NumNodes:       func() int { return 1 },
+			RetransmitMult: 3,
+		}
+		wanConfig.Delegate = &network.MyDelegate{
+			Meta:       config.Delegate.(*network.MyDelegate).Meta, // Шаримо ті самі метадані для compose.Service Discovery
+			Broadcasts: wanBroadcasts,
+		}
+		wanConfig.Events = &network.MyEventDelegate{NetManager: netManager}
+
+		var errWan error
+		wanList, errWan = memberlist.Create(wanConfig)
+		if errWan != nil {
+			log.Fatalf("Помилка створення WAN Gossip (Federation): %v", errWan)
+		}
+		wanBroadcasts.NumNodes = func() int { return wanList.NumMembers() }
+
+		// 1.2.2: Глобальний Bootstrap (Seed Nodes) - тепер через Federation WAN
+		// Якщо вказані IP адреси, приєднуємося до них через WAN/Internet
+		log.Printf("Gossip: Спроба підключення до WAN вузлів: %s", joinAddr)
+		_, err = wanList.Join(strings.Split(joinAddr, ","))
+		if err != nil {
+			log.Printf("Помилка підключення до WAN-кластера: %v", err)
+		}
 	}
 
 	// 1.4.3 та 4.4: Додаємо обробник подій
@@ -286,45 +344,6 @@ func main() {
 	// 1.2.1: Запускаємо Auto-Discovery через mDNS (Пункт 9.1)
 	go network.SetupMDNS(list, token, config.BindPort)
 
-	// 7.2: Георозподілені кластери (Federation)
-	// Створюємо окреме кільце WAN для об'єднання незалежних Raft-кластерів
-	wanConfig := memberlist.DefaultWANConfig()
-	wanConfig.SecretKey = tokenHash[:] // Застосовуємо шифрування і для WAN-кільця
-	if name != "" {
-		wanConfig.Name = name + "-wan"
-	} else {
-		wanConfig.Name = "wan-" + fmt.Sprintf("%d", time.Now().Unix())
-	}
-	wanConfig.BindPort = port + 1000 // Наприклад 9001, якщо LAN Gossip на 8001
-
-	wanBroadcasts := &memberlist.TransmitLimitedQueue{
-		NumNodes:       func() int { return 1 },
-		RetransmitMult: 3,
-	}
-	wanConfig.Delegate = &network.MyDelegate{
-		Meta:       config.Delegate.(*network.MyDelegate).Meta, // Шаримо ті самі метадані для compose.Service Discovery
-		Broadcasts: wanBroadcasts,
-	}
-	wanConfig.Events = eventDelegate
-
-	wanList, err := memberlist.Create(wanConfig)
-	if err != nil {
-		log.Fatalf("Помилка створення WAN Gossip (Federation): %v", err)
-	}
-	wanBroadcasts.NumNodes = func() int { return wanList.NumMembers() }
-
-	// 1.2.2: Глобальний Bootstrap (Seed Nodes) - тепер через Federation WAN
-	// Якщо вказані IP адреси, приєднуємося до них через WAN/Internet
-	if joinAddr != "" {
-		seeds := strings.Split(joinAddr, ",")
-		log.Printf("Спроба підключення до WAN Federation (інші дата-центри): %v", seeds)
-		_, err := wanList.Join(seeds)
-		if err != nil {
-			log.Printf("Помилка приєднання до Federation %v: %v", seeds, err)
-		} else {
-			log.Printf("Успішно приєднано до глобального кластера (Federation) через %v!", seeds)
-		}
-	}
 
 	// Виводимо інформацію про те, що вузол успішно стартував як рівноправний учасник
 	localNode := list.LocalNode()
@@ -364,6 +383,13 @@ func main() {
 
 	// Пункт 2.1.1: Запуск Raft
 	// Використовуємо кастомний Listener замість звичайного TCP та передаємо прапорець bootstrap
+	if isBootstrap {
+		time.Sleep(2 * time.Second)
+		if list.NumMembers() > 1 || (wanList != nil && wanList.NumMembers() > 1) {
+			log.Println("Знайдено існуючий кластер. Перемикання в режим приєднання (start) замість bootstrap.")
+			isBootstrap = false
+		}
+	}
 	raftNode, err := cluster.SetupRaftWithListener(localNode.Name, listener.Addr().String(), raftListener, nodeDataDir, fsm, isBootstrap)
 	if err != nil {
 		log.Fatalf("Помилка запуску Raft: %v", err)
@@ -375,8 +401,10 @@ func main() {
 	// Незалежний токен для UI
 	apiToken := cfg.UIToken
 	if apiToken == "" {
-		b := make([]byte, 8)
-		rand.Read(b)
+		b := make([]byte, 32)
+		if _, err := rand.Read(b); err != nil {
+			log.Fatalf("Fatal: failed to generate API token: %v", err)
+		}
 		apiToken = hex.EncodeToString(b)
 		cfg.UIToken = apiToken
 		cfgPkg.SaveConfig(configPath, cfg)
@@ -384,6 +412,20 @@ func main() {
 
 	// Пункт 3: Запуск децентралізованого планувальника
 	scheduler := scheduler.NewScheduler(localNode.Name, fmt.Sprintf("127.0.0.1:%d", raftPort), config.Delegate.(*network.MyDelegate).Meta, apiToken)
+	
+	// C-11: Pass live-node check to Scheduler to prevent split-brain during Standby promotion
+	scheduler.IsNodeAlive = func(nodeID string) bool {
+		if list == nil {
+			return false
+		}
+		for _, member := range list.Members() {
+			if member.Name == nodeID && member.State == memberlist.StateAlive {
+				return true
+			}
+		}
+		return false
+	}
+	
 	scheduler.Start()
 
 	// Запуск внутрішнього DNS сервера
@@ -397,6 +439,8 @@ func main() {
 		log.Printf("Попередження: не вдалося підключитися до containerd (можливо він не встановлений): %v", err)
 	} else {
 		engine.EnsureCNIPlugins()
+		// C-10: Provide container state checker to scheduler for lease renewal
+		scheduler.ContainerChecker = cm.IsContainerRunning
 		agent = engine.NewAgent(localNode.Name, scheduler, cm)
 		agent.Start()
 		fmt.Println("✓ Containerd engine.Agent успішно запущено")
@@ -414,7 +458,7 @@ func main() {
 	// (apiToken already generated above)
 
 	// Пункт 2.3: Запуск HTTP API сервера для маршрутизації записів (Write Forwarding)
-	apiServer := api.NewAPIServer(raftNode, fsm, netManager, apiToken, cm)
+	apiServer := api.NewAPIServer(raftNode, fsm, netManager, apiToken, cm, localNode.Name)
 	go func() {
 		// Спробуємо отримати вбудований UI (якщо vite build був запущений)
 		var uiFS http.FileSystem
@@ -473,4 +517,42 @@ func main() {
 	wanList.Shutdown()
 	listener.Close()
 	fmt.Println("Вузол успішно зупинено.")
+}
+
+// getOutboundIP отримує локальну IP-адресу, обходячи мережеві інтерфейси
+func getOutboundIP() string {
+	ifaces, err := net.Interfaces()
+	if err == nil {
+		for _, i := range ifaces {
+			if i.Flags&net.FlagUp == 0 || i.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			// Пропускаємо віртуальні інтерфейси
+			if strings.HasPrefix(i.Name, "docker") || strings.HasPrefix(i.Name, "p2ser") || strings.HasPrefix(i.Name, "vxlan") || strings.HasPrefix(i.Name, "br-") {
+				continue
+			}
+			addrs, err := i.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, addr := range addrs {
+				var ip net.IP
+				switch v := addr.(type) {
+				case *net.IPNet:
+					ip = v.IP
+				case *net.IPAddr:
+					ip = v.IP
+				}
+				if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+					continue
+				}
+				ip = ip.To4()
+				if ip != nil {
+					return ip.String()
+				}
+			}
+		}
+	}
+	log.Println("Попередження: не вдалося визначити локальний IP, використовуємо 127.0.0.1")
+	return "127.0.0.1"
 }

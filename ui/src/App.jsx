@@ -10,8 +10,22 @@ import './index.css'
 // SECURITY: Token is read from localStorage (set via Settings page).
 // Never commit real tokens to source code.
 const API_TOKEN = () => localStorage.getItem('p2ser_api_token') || '';
-const API_BASE = `${window.location.protocol}//${window.location.hostname}:8002`;
-const API_WS_BASE = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.hostname}:8002`;
+const getApiBase = () => {
+  const ep = localStorage.getItem('p2ser_endpoint');
+  return ep ? ep.replace(/\/$/, '') : `${window.location.protocol}//${window.location.hostname}:8002`;
+};
+const API_BASE = getApiBase();
+const API_WS_BASE = API_BASE.replace(/^http/, 'ws');
+
+const authFetch = (url, options = {}) => {
+  return fetch(url, {
+    ...options,
+    headers: {
+      ...options.headers,
+      'Authorization': `Bearer ${API_TOKEN()}`
+    }
+  });
+};
 
 // Icons (using simple SVG for zero-dependency but keeping aesthetics)
 const IconDashboard = () => (
@@ -20,9 +34,7 @@ const IconDashboard = () => (
 const IconProjects = () => (
   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
 )
-const IconMarketplace = () => (
-  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="9" cy="21" r="1"></circle><circle cx="20" cy="21" r="1"></circle><path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"></path></svg>
-)
+
 const IconSettings = () => (
   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
 )
@@ -42,9 +54,9 @@ export default function App() {
     name: '',
     sourceType: 'folder',
     gitUrl: '',
-    gitBranch: 'main',
+    branch: 'main',
     envVars: '',
-    cpu: '1', ram: '2', storage: '10', replicas: '1', standby: '0', mode: 'folder'
+    mode: 'folder'
   })
   const [selectedFiles, setSelectedFiles] = useState([])
   const [logsModal, setLogsModal] = useState({show: false, title: '', content: ''})
@@ -56,26 +68,51 @@ export default function App() {
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const statsRes = await fetch(`${API_BASE}/stats?token=${API_TOKEN()}`);
+        const statsRes = await authFetch(`${API_BASE}/stats`);
         if (statsRes.ok) {
           const s = await statsRes.json();
-          setRealStats(prev => ({...prev, cpu: s.cpu, ram_used: s.ram_used, ram_total: s.ram_total}));
+          setRealStats(prev => ({...prev, cpu: s.cpu, ram_used: s.ram_used, ram_total: s.ram_total, geo_ip_error: s.geo_ip_error}));
         }
-        const podsRes = await fetch(`${API_BASE}/pods?token=${API_TOKEN()}`);
+        const podsRes = await authFetch(`${API_BASE}/pods`);
         if (podsRes.ok) {
           const p = await podsRes.json();
           let podsList = [];
           if (Array.isArray(p)) {
-              podsList = p.map(pod => ({ id: pod.id, name: pod.app || pod.id, image: pod.image, status: pod.status, uptime: 'Live' }));
+              podsList = p.map(pod => ({ id: pod.id, name: pod.app || pod.id, image: pod.image, status: pod.status, uptime: 'Live', project: pod.project, app: pod.app, cpu_req: pod.cpu_req, ram_req: pod.ram_req, dir: pod.dir }));
           } else if (p.namespaces) {
             Object.keys(p.namespaces).forEach(ns => {
               p.namespaces[ns].forEach(pod => {
-                podsList.push({ id: pod.id, name: pod.name, image: pod.image, status: pod.status, uptime: 'Live' });
+                podsList.push({ id: pod.id, name: pod.name || pod.app || pod.id, image: pod.image, status: pod.status, uptime: 'Live', project: pod.project || ns, app: pod.app, cpu_req: pod.cpu_req, ram_req: pod.ram_req, dir: pod.dir });
               });
             });
           }
           setRealPods(podsList);
           setRealStats(prev => ({...prev, active_pods: podsList.length}));
+
+          // M-18: Build projects from pods dynamically
+          const projMap = {};
+          podsList.forEach(pod => {
+            const pName = pod.project || pod.app || 'default';
+            if (!projMap[pName]) {
+              projMap[pName] = {
+                id: pName,
+                name: pName,
+                dir: pod.dir || '',
+                cpuQuota: 0,
+                ramQuota: 0,
+                podsCount: 0
+              };
+            }
+            projMap[pName].podsCount++;
+            projMap[pName].cpuQuota += (pod.cpu_req || 0);
+            projMap[pName].ramQuota += (pod.ram_req || 0);
+          });
+          const fetchedProjects = Object.values(projMap).map(p => ({
+            ...p,
+            cpuQuota: p.cpuQuota > 0 ? p.cpuQuota + ' Cores' : 'Auto',
+            ramQuota: p.ramQuota > 0 ? p.ramQuota + ' MB' : 'Auto'
+          }));
+          setProjects(fetchedProjects);
         }
       } catch (err) {
         console.error("Backend offline or not reachable");
@@ -123,7 +160,6 @@ export default function App() {
           <h1 className="page-title">
             {activeTab === 'dashboard' && 'Cluster Overview'}
             {activeTab === 'projects' && 'Namespaces & Projects'}
-            {activeTab === 'marketplace' && 'App Catalog'}
             {activeTab === 'converter' && 'Compose → P2SER Converter'}
             {activeTab === 'settings' && 'Cluster Settings'}
           </h1>
@@ -135,6 +171,24 @@ export default function App() {
 
         {activeTab === 'dashboard' && (
           <>
+            {realStats.geo_ip_error && (
+              <div style={{
+                background: 'rgba(245, 158, 11, 0.1)',
+                border: '1px solid var(--warning)',
+                color: 'var(--warning)',
+                padding: '16px',
+                borderRadius: '12px',
+                marginBottom: '24px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '12px'
+              }}>
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
+                <div>
+                  <strong>Geo-IP Sanctions Filter Warning:</strong> {realStats.geo_ip_error}
+                </div>
+              </div>
+            )}
             <div className="dashboard-grid animate-fade-in delay-2">
               {stats.map((stat, i) => (
                 <div className="glass-card" key={i}>
@@ -175,12 +229,11 @@ export default function App() {
                     </div>
                   </div>
                   
-                  {/* Action Buttons */}
                   <div style={{display: 'flex', gap: '8px', borderTop: '1px solid var(--border-color)', paddingTop: '16px', marginTop: '16px', width: '100%', justifyContent: 'flex-end'}}>
                     <button style={{background: 'rgba(59, 130, 246, 0.1)', border: '1px solid var(--accent-primary)', color: 'var(--accent-primary)', padding: '6px 12px', borderRadius: '6px', cursor: 'pointer', fontSize: '13px'}} onClick={() => setTerminalModal({show: true, podId: pod.id, podName: pod.name})}>Terminal</button>
                     <button style={{background: 'rgba(255, 255, 255, 0.05)', border: '1px solid var(--border-color)', color: 'var(--text-primary)', padding: '6px 12px', borderRadius: '6px', cursor: 'pointer', fontSize: '13px'}} onClick={async () => {
                         try {
-                            const res = await fetch(`${API_BASE}/pod/logs?id=${pod.id}&token=${API_TOKEN()}`);
+                            const res = await authFetch(`${API_BASE}/pod/logs?id=${pod.id}`);
                             if (res.ok) {
                                 const text = await res.text();
                                 setLogsModal({show: true, title: 'Logs for ' + pod.name, content: text || '(Empty)'});
@@ -191,14 +244,14 @@ export default function App() {
                     }}>Logs</button>
                     <button style={{background: 'rgba(245, 158, 11, 0.1)', border: '1px solid var(--warning)', color: 'var(--warning)', padding: '6px 12px', borderRadius: '6px', cursor: 'pointer', fontSize: '13px'}} onClick={async () => {
                         try {
-                            const res = await fetch(`${API_BASE}/pod/restart?id=${pod.id}&token=${API_TOKEN()}`, { method: 'POST' });
+                            const res = await authFetch(`${API_BASE}/pod/restart?id=${pod.id}`, { method: 'POST' });
                             if (res.ok) alert("Pod restart initiated!");
                             else alert("Failed to restart pod: " + await res.text());
                         } catch (e) { alert("Error: " + e.message); }
                     }}>Restart</button>
                     <button style={{background: 'rgba(239, 68, 68, 0.1)', border: '1px solid var(--danger)', color: 'var(--danger)', padding: '6px 12px', borderRadius: '6px', cursor: 'pointer', fontSize: '13px'}} onClick={async () => {
                         try {
-                            const res = await fetch(`${API_BASE}/pod?id=${pod.id}&token=${API_TOKEN()}`, { method: 'DELETE' });
+                            const res = await authFetch(`${API_BASE}/pod?id=${pod.id}`, { method: 'DELETE' });
                             if (res.ok) alert("Pod stopped (deleted from cluster)");
                             else alert("Failed to stop pod: " + await res.text());
                         } catch (e) { alert("Error: " + e.message); }
@@ -306,30 +359,30 @@ export default function App() {
               </div>
 
               <div style={{marginBottom: '32px'}}>
-                <h3 style={{marginBottom: '16px'}}>Network & Domains</h3>
-                <div className="glass-card">
+                <h3 style={{marginBottom: '16px'}}>Network & Domains <span style={{fontSize: '12px', background: 'var(--accent-primary)', color: 'white', padding: '2px 6px', borderRadius: '4px', marginLeft: '8px'}}>Coming Soon</span></h3>
+                <div className="glass-card" style={{opacity: 0.6}}>
                   <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px'}}>
                     <div>
                       <div style={{fontWeight: 'bold', marginBottom: '4px'}}>Ingress Controller</div>
                       <div style={{fontSize: '13px', color: 'var(--text-secondary)'}}>Handle incoming traffic and route to services</div>
                     </div>
-                    <div className="status-badge status-running">Running</div>
+                    <div className="status-badge" style={{background: 'rgba(255,255,255,0.1)', color: 'var(--text-secondary)'}}>Not Configured</div>
                   </div>
-                  <button style={{background: 'var(--card-bg)', border: '1px solid var(--border-color)', color: 'var(--text-primary)', padding: '6px 16px', borderRadius: '6px', cursor: 'pointer'}}>Configure Domains</button>
+                  <button disabled style={{background: 'var(--card-bg)', border: '1px solid var(--border-color)', color: 'var(--text-secondary)', padding: '6px 16px', borderRadius: '6px', cursor: 'not-allowed'}}>Configure Domains</button>
                 </div>
               </div>
               
               <div>
-                <h3 style={{marginBottom: '16px'}}>Security & Secrets</h3>
-                <div className="glass-card">
+                <h3 style={{marginBottom: '16px'}}>Security & Secrets <span style={{fontSize: '12px', background: 'var(--accent-primary)', color: 'white', padding: '2px 6px', borderRadius: '4px', marginLeft: '8px'}}>Coming Soon</span></h3>
+                <div className="glass-card" style={{opacity: 0.6}}>
                   <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px'}}>
                     <div>
                       <div style={{fontWeight: 'bold', marginBottom: '4px'}}>Global Environment Variables</div>
                       <div style={{fontSize: '13px', color: 'var(--text-secondary)'}}>Shared secrets across all projects</div>
                     </div>
-                    <div style={{fontSize: '13px', color: 'var(--text-secondary)'}}>4 Secrets active</div>
+                    <div style={{fontSize: '13px', color: 'var(--text-secondary)'}}>0 Secrets active</div>
                   </div>
-                  <button style={{background: 'var(--card-bg)', border: '1px solid var(--border-color)', color: 'var(--text-primary)', padding: '6px 16px', borderRadius: '6px', cursor: 'pointer'}}>Manage Secrets</button>
+                  <button disabled style={{background: 'var(--card-bg)', border: '1px solid var(--border-color)', color: 'var(--text-secondary)', padding: '6px 16px', borderRadius: '6px', cursor: 'not-allowed'}}>Manage Secrets</button>
                 </div>
               </div>
             </div>
@@ -467,79 +520,7 @@ export default function App() {
               </div>
               )}
 
-              <div style={{display: 'flex', flexDirection: 'column', gap: '8px'}}>
-                  <div style={{display: 'flex', justifyContent: 'space-between'}}>
-                    <span style={{color: 'white'}}>CPU Quota (Cores)</span>
-                    <span style={{color: 'var(--accent-primary)', fontWeight: 'bold'}}>{newProjectForm.cpu}</span>
-                  </div>
-                  <input 
-                    type="range" 
-                    min="1" 
-                    max={navigator.hardwareConcurrency || 8} 
-                    value={newProjectForm.cpu}
-                    onChange={e => setNewProjectForm({...newProjectForm, cpu: e.target.value})}
-                    style={{accentColor: 'var(--accent-primary)'}}
-                  />
-                </div>
 
-                <div style={{display: 'flex', flexDirection: 'column', gap: '8px'}}>
-                  <div style={{display: 'flex', justifyContent: 'space-between'}}>
-                    <span style={{color: 'white'}}>RAM Quota (GB)</span>
-                    <span style={{color: 'var(--accent-primary)', fontWeight: 'bold'}}>{newProjectForm.ram} GB</span>
-                  </div>
-                  <input 
-                    type="range" 
-                    min="1" 
-                    max={Math.max(1, Math.floor(parseFloat(realStats.ram_total) || 16))} 
-                    value={newProjectForm.ram}
-                    onChange={e => setNewProjectForm({...newProjectForm, ram: e.target.value})}
-                    style={{accentColor: 'var(--accent-primary)'}}
-                  />
-                </div>
-
-                <div style={{display: 'flex', flexDirection: 'column', gap: '8px'}}>
-                  <div style={{display: 'flex', justifyContent: 'space-between', marginBottom: '8px'}}>
-                    <span style={{color: 'white'}}>Storage Quota (GB)</span>
-                    <span style={{color: 'var(--accent-primary)', fontWeight: 'bold'}}>{newProjectForm.storage} GB</span>
-                  </div>
-                  <input 
-                    type="range" 
-                    min="1" max="500" step="5"
-                    value={newProjectForm.storage}
-                    onChange={e => setNewProjectForm({...newProjectForm, storage: e.target.value})}
-                    style={{width: '100%', cursor: 'pointer', accentColor: 'var(--accent-primary)'}}
-                  />
-                </div>
-
-                <div style={{display: 'flex', flexDirection: 'column', gap: '8px'}}>
-                  <div style={{display: 'flex', justifyContent: 'space-between'}}>
-                    <span style={{color: 'white'}}>Replicas (Active)</span>
-                    <span style={{color: 'var(--accent-primary)', fontWeight: 'bold'}}>{newProjectForm.replicas}</span>
-                  </div>
-                  <input 
-                    type="range" 
-                    min="1" 
-                    max="10" 
-                    value={newProjectForm.replicas}
-                    onChange={e => setNewProjectForm({...newProjectForm, replicas: e.target.value})}
-                    style={{accentColor: 'var(--accent-primary)'}}
-                  />
-                </div>
-
-                <div style={{display: 'flex', flexDirection: 'column', gap: '8px'}}>
-                  <div style={{display: 'flex', justifyContent: 'space-between'}}>
-                    <span style={{color: 'white'}}>Standby (Warm Reserve)</span>
-                    <span style={{color: 'var(--accent-primary)', fontWeight: 'bold'}}>{newProjectForm.standby}</span>
-                  </div>
-                  <input 
-                    type="range" 
-                    min="0" 
-                    max="5" 
-                    value={newProjectForm.standby}
-                    onChange={e => setNewProjectForm({...newProjectForm, standby: e.target.value})}
-                    style={{accentColor: 'var(--accent-primary)'}}
-                  />
-                </div>
             </div>
 
             <div style={{display: 'flex', justifyContent: 'flex-end', gap: '12px', marginTop: '32px'}}>
@@ -565,7 +546,7 @@ export default function App() {
                               });
                           }
 
-                          const res = await fetch(`${API_BASE}/deploy-git?projectName=${encodeURIComponent(newProjectForm.name || 'default')}&token=${API_TOKEN()}`, {
+                          const res = await authFetch(`${API_BASE}/deploy-git?projectName=${encodeURIComponent(newProjectForm.name || 'default')}`, {
                               method: 'POST',
                               headers: {
                                   'Content-Type': 'application/json'
@@ -619,7 +600,7 @@ export default function App() {
                           const formData = new FormData();
                           formData.append('project', zipBlob, 'project.zip');
 
-                          const res = await fetch(`${API_BASE}/upload?projectName=${encodeURIComponent(newProjectForm.name || 'default')}&token=${API_TOKEN()}`, {
+                          const res = await authFetch(`${API_BASE}/upload?projectName=${encodeURIComponent(newProjectForm.name || 'default')}`, {
                               method: 'POST',
                               body: formData
                           });
@@ -757,7 +738,15 @@ function yamlStringify(obj, indent = 0) {
 }
 
 function highlightYaml(text) {
-  return text
+  // HTML-escape before injecting into dangerouslySetInnerHTML
+  const escaped = text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+
+  return escaped
     .replace(/^(#.*)$/gm, '<span style="color:#6b7280">$1</span>')
     .replace(/^([ \t]*)(x-[\w-]+)(:.*)$/gm, '$1<span style="color:#f59e0b">$2</span><span style="color:#a78bfa">$3</span>')
     .replace(/^([ \t]*)(\w[\w-]*)(:.*)$/gm, (_, sp, key, rest) => {
@@ -894,7 +883,7 @@ function ComposeConverter({ apiToken }) {
       if (envText.trim()) {
         headers['X-Env-Vars'] = btoa(unescape(encodeURIComponent(envText)));
       }
-      const res = await fetch(`${API_BASE}/compose?token=${apiToken}`, {
+      const res = await authFetch(`${API_BASE}/compose`, {
         method: 'POST',
         headers,
         body: outputYaml,
@@ -1228,28 +1217,34 @@ function TerminalWindow({ podId, podName, onClose }) {
     term.current.open(terminalRef.current);
     fitAddon.fit();
 
-    // Connect WebSocket
-    const wsUrl = `${API_WS_BASE}/pod/exec?id=${podId}&token=${API_TOKEN()}`;
-    socket.current = new WebSocket(wsUrl);
+    // Connect WebSocket via Ticket (H-12)
+    authFetch(`${API_BASE}/ticket`, { method: 'POST' }).then(res => {
+      if (res.ok) return res.json();
+      throw new Error("Ticket request failed");
+    }).then(data => {
+      const wsUrl = `${API_WS_BASE}/pod/exec?id=${podId}&ticket=${data.ticket}`;
+      socket.current = new WebSocket(wsUrl);
 
-    socket.current.onopen = () => {
-      term.current.writeln(`\x1b[32m*** Connected to ${podName} ***\x1b[0m`);
-    };
+      socket.current.onopen = () => {
+        term.current.writeln(`\x1b[32m*** Connected to ${podName} ***\x1b[0m`);
+      };
 
-    socket.current.onmessage = (event) => {
-      term.current.write(event.data);
-    };
+      socket.current.onmessage = (event) => {
+        term.current.write(event.data);
+      };
 
-    socket.current.onclose = () => {
-      term.current.writeln('\r\n\x1b[31m*** Connection closed ***\x1b[0m');
-    };
+      socket.current.onclose = () => {
+        term.current.writeln('\r\n\x1b[31m*** Connection closed ***\x1b[0m');
+      };
 
-    term.current.onData((data) => {
-      if (socket.current.readyState === WebSocket.OPEN) {
-        socket.current.send(data);
-      }
+      term.current.onData((data) => {
+        if (socket.current.readyState === WebSocket.OPEN) {
+          socket.current.send(data);
+        }
+      });
+    }).catch(err => {
+      term.current.writeln(`\r\n\x1b[31m*** Failed to connect: ${err.message} ***\x1b[0m`);
     });
-
     const handleResize = () => fitAddon.fit();
     window.addEventListener('resize', handleResize);
 

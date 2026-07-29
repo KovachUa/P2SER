@@ -22,23 +22,43 @@ import (
 const namedVolumeDir = "/var/lib/p2ser/volumes"
 
 // resolveVolumeSrc резолвить named volume у абсолютний шлях на хості.
-// Якщо src вже абсолютний або відносний (./...) — повертає як є.
-// Якщо src — назва named volume (наприклад "yhtv_pgdata") — резолвить у /var/lib/p2ser/volumes/yhtv_pgdata
-func resolveVolumeSrc(src string) string {
+// C-13: Забороняє вихід за межі дозволених директорій (Path Traversal / Host Compromise).
+func resolveVolumeSrc(src string) (string, error) {
 	if filepath.IsAbs(src) {
-		return src
+		// Забороняємо довільні абсолютні шляхи на хості (напр. /:/host)
+		// Дозволяємо лише якщо це вже всередині namedVolumeDir
+		cleanSrc := filepath.Clean(src)
+		if !strings.HasPrefix(cleanSrc, namedVolumeDir) {
+			// Якщо це тимчасова директорія збірки (з deploy), дозволяємо
+			if strings.HasPrefix(cleanSrc, os.TempDir()) {
+				return cleanSrc, nil
+			}
+			return "", fmt.Errorf("безпека: абсолютний шлях %s заборонено", src)
+		}
+		return cleanSrc, nil
 	}
 	if strings.HasPrefix(src, "./") || strings.HasPrefix(src, "../") {
+		// Відносні шляхи вже мають бути відрезолвлені парсером відносно workingDir.
+		// Якщо вони дійшли сюди сирими, значить workingDir не був заданий.
+		// Відхиляємо ../ щоб уникнути виходу за межі.
+		cleanSrc := filepath.Clean(src)
+		if strings.HasPrefix(cleanSrc, "..") {
+			return "", fmt.Errorf("безпека: відносний шлях з виходом за межі (%s) заборонено", src)
+		}
 		abs, err := filepath.Abs(src)
 		if err == nil {
-			return abs
+			return abs, nil
 		}
-		return src
+		return src, nil
 	}
 	// Named volume — резолвимо в /var/lib/p2ser/volumes/<name>
 	resolved := filepath.Join(namedVolumeDir, src)
+	// Перевірка на path traversal у самій назві volume (напр. "../../etc")
+	if !strings.HasPrefix(filepath.Clean(resolved), namedVolumeDir) {
+		return "", fmt.Errorf("безпека: некоректна назва volume %s", src)
+	}
 	log.Printf("Volume: named volume '%s' → '%s'", src, resolved)
-	return resolved
+	return resolved, nil
 }
 
 // ContainerManager відповідає за пряму взаємодію з containerd (Пункт 5.1)
@@ -121,8 +141,12 @@ func (cm *ContainerManager) RunContainer(ctx context.Context, pod scheduler.Pod)
 	for _, v := range pod.Volumes {
 		parts := strings.Split(v, ":")
 		if len(parts) >= 2 {
-			// Резолвимо named volumes у абсолютні шляхи
-			src := resolveVolumeSrc(parts[0])
+			// Резолвимо named volumes у абсолютні шляхи (з перевіркою безпеки C-13)
+			src, err := resolveVolumeSrc(parts[0])
+			if err != nil {
+				log.Printf("Volume: пропущено %s через порушення політики безпеки: %v", parts[0], err)
+				continue
+			}
 			dst := parts[1]
 			opts := []string{"rbind"}
 			if len(parts) >= 3 && parts[2] == "ro" {

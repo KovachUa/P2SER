@@ -22,7 +22,15 @@ type NodeConfig struct {
 	VPSPubKey   string `yaml:"vps_pubkey"`
 	VPSPrivKey  string `yaml:"vps_privkey"`
 	VPSTunnelIP string `yaml:"vps_tunnel_ip"`
+
+	// L-11: Операційні налаштування
+	PodSubnet       string   `yaml:"pod_subnet"`
+	BridgeName      string   `yaml:"bridge_name"`
+	UpstreamDNS     string   `yaml:"upstream_dns"`
+	SanctionedCodes []string `yaml:"sanctioned_codes"`
 }
+
+var GlobalConfig *NodeConfig
 
 // LoadConfig завантажує конфігурацію з файлу
 func LoadConfig(path string) (*NodeConfig, error) {

@@ -153,11 +153,17 @@ func ParseComposeFile(projectName string, content []byte, envMap map[string]stri
 		for i := 0; i < replicas; i++ {
 			podID := fmt.Sprintf("%s-active-%d", name, i)
 
+			runAsUser := svc.User
+			if runAsUser == "" {
+				// C-13: Default to non-root execution unless explicitly specified
+				runAsUser = "1000:1000"
+			}
+
 			pod := scheduler.Pod{
 				ID:          podID,
 				BaseID:      podID, // 6.4: Зберігаємо базовий ідентифікатор
 				Image:       imageName,
-				RunAsUser:   svc.User,
+				RunAsUser:   runAsUser,
 				Ports:       svc.Ports,
 				Volumes:     volList,
 				UsernsRemap: svc.XUsernsRemap,

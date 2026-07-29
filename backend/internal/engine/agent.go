@@ -47,7 +47,11 @@ func (a *Agent) checkHealth(probe *scheduler.HealthCheck, podIP string) bool {
 	if probe.Type == "http" {
 		client := http.Client{Timeout: 2 * time.Second}
 		resp, err := client.Get(fmt.Sprintf("http://%s%s", address, probe.Path))
-		if err != nil || resp.StatusCode >= 400 {
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
 			return false
 		}
 		return true
@@ -87,6 +91,9 @@ func (a *Agent) reconcile() {
 	ctx := context.Background()
 
 	for _, pod := range myPods {
+		if pod.Status == "Fenced" {
+			continue // C-10: skip auto-restart for fenced pods
+		}
 		if pod.Status == "Scheduled" || pod.Status == "Running" {
 			// Перевіряємо фактичний стан в containerd
 			isRunning, err := a.cm.IsContainerRunning(ctx, pod.ID)
@@ -152,7 +159,8 @@ func (a *Agent) reconcile() {
 					} else {
 						log.Printf("Agent: [Healthcheck] Контейнер %s НЕ пройшов Readiness Probe (тимчасово недоступний).", pod.ID)
 					}
-					// TODO: відправити оновлення pod.Ready на API сервер (маршрутизатор перенаправить/перестане перенаправляти трафік)
+					// H-14: Зберігаємо стан готовності
+					a.scheduler.UpdatePod(pod)
 				}
 			}
 		}
@@ -173,6 +181,9 @@ func (a *Agent) FenceStatefulPods() {
 			log.Printf("!!! FENCING ACTIVATED !!! Примусова зупинка Stateful-контейнера %s для захисту даних (Split-Brain)!", pod.ID)
 			_ = a.cm.StopContainer(ctx, pod.ID)
 			// В реальній системі тут також відбудеться відмонтування мережевих дисків/томів
+			// C-10: Persist Fenced status
+			pod.Status = "Fenced"
+			a.scheduler.UpdatePod(pod)
 		}
 	}
 }

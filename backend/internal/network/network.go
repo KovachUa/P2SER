@@ -4,20 +4,61 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
+	"time"
 
+	"github.com/kovach/p2ser/internal/config"
 	"github.com/vishvananda/netlink"
 )
 
 // NetworkManager відповідає за Розділ 4: Мережева інфраструктура Pod-ів
 type NetworkManager struct {
-	nodeID  string
-	localIP string
-	subnet  string
+	nodeID      string
+	localIP     string
+	subnet      string
+	geoIPError  string
+	nodeMetrics map[string]NodeMetrics
+	mu          sync.RWMutex
+}
+
+func (nm *NetworkManager) UpdateNodeMetrics(metrics NodeMetrics) {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+	if nm.nodeMetrics == nil {
+		nm.nodeMetrics = make(map[string]NodeMetrics)
+	}
+	nm.nodeMetrics[metrics.Node] = metrics
+}
+
+func (nm *NetworkManager) GetNodeMetrics(nodeID string) (NodeMetrics, bool) {
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
+	if nm.nodeMetrics == nil {
+		return NodeMetrics{}, false
+	}
+	m, ok := nm.nodeMetrics[nodeID]
+	return m, ok
+}
+
+func (nm *NetworkManager) GetGeoIPError() string {
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
+	return nm.geoIPError
+}
+
+func (nm *NetworkManager) setGeoIPError(errStr string) {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+	nm.geoIPError = errStr
 }
 
 func NewNetworkManager(nodeID, localIP string) *NetworkManager {
@@ -126,34 +167,119 @@ func (nm *NetworkManager) UpdateRouteTable(peerNodeID, peerIP, peerSubnet string
 	err = netlink.RouteAdd(route)
 	if err != nil && !strings.Contains(err.Error(), "file exists") {
 		log.Printf("Маршрутизація Помилка: не вдалося додати маршрут до %s: %v", peerSubnet, err)
-	} else if err == nil {
+	} else if err == nil || strings.Contains(err.Error(), "file exists") {
 		log.Printf("Маршрутизація: Додано/Оновлено маршрут до %s через фізичний IP %s (Пункт 4.4)", peerSubnet, peerIP)
+	}
+
+	// C-8: Add FDB entry for VXLAN
+	hwAddr, _ := net.ParseMAC("00:00:00:00:00:00")
+	neigh := &netlink.Neigh{
+		LinkIndex:    link.Attrs().Index,
+		State:        netlink.NUD_PERMANENT,
+		Family:       syscall.AF_BRIDGE,
+		Flags:        netlink.NTF_SELF,
+		IP:           gw,
+		HardwareAddr: hwAddr,
+	}
+	err = netlink.NeighAppend(neigh)
+	if err != nil {
+		log.Printf("VXLAN FDB Помилка: не вдалося додати FDB запис для %s: %v", peerIP, err)
+	} else {
+		log.Printf("VXLAN FDB: Додано/Оновлено FDB запис для фізичного IP %s", peerIP)
 	}
 }
 
-	// ApplyGeoIPSanctions реалізує Пункт 7.1 (Geo-IP Санкційний Фільтр через iptables/ipset)
-// C-3 SECURITY NOTE: the GeoIP zone download uses plain HTTP from ipdeny.com.
-// TODO: replace with HTTPS + Go native http.Get + local caching to prevent SSRF and supply-chain attacks.
+// ApplyGeoIPSanctions реалізує Пункт 7.1 (Geo-IP Санкційний Фільтр через iptables/ipset)
+// M-10: Atomic ipset swap, native Go HTTP, and local caching.
 func (nm *NetworkManager) ApplyGeoIPSanctions() {
-	// Список країн-агресорів (РФ, РБ)
 	countries := []string{"ru", "by"}
+	if config.GlobalConfig != nil && len(config.GlobalConfig.SanctionedCodes) > 0 {
+		countries = config.GlobalConfig.SanctionedCodes
+	}
+	
+	// Ensure lower case for URLs
+	for i, c := range countries {
+		countries[i] = strings.ToLower(c)
+	}
 
-	// 1. Створюємо ipset для ефективного блокування десятків тисяч підмереж
+	cacheDir := "/var/lib/p2ser/geoip"
+	os.MkdirAll(cacheDir, 0755)
+
+	// Переконуємось, що основний ipset існує
 	_ = exec.Command("ipset", "create", "p2ser_sanctions", "hash:net").Run()
 
-	// Очищаємо перед оновленням
-	_ = exec.Command("ipset", "flush", "p2ser_sanctions").Run()
+	tmpSetName := fmt.Sprintf("p2ser_sanctions_tmp_%d", time.Now().Unix())
+	_ = exec.Command("ipset", "create", tmpSetName, "hash:net").Run()
+	defer exec.Command("ipset", "destroy", tmpSetName).Run()
+
+	var allErrors []string
+	success := true
 
 	for _, country := range countries {
 		log.Printf("Geo-IP: Завантаження бази адрес для країни: %s...", country)
+		
+		cacheFile := filepath.Join(cacheDir, country+".zone")
+		var reader io.Reader
 
-		// TODO C-3: замінити на Go http.Get + HTTPS + локальний кеш замість sh -c скрипту
-		script := fmt.Sprintf("curl -s https://www.ipdeny.com/ipblocks/data/countries/%s.zone | awk '{print \"add p2ser_sanctions \" $1}' | ipset restore", country)
+		resp, err := http.Get(fmt.Sprintf("https://www.ipdeny.com/ipblocks/data/countries/%s.zone", country))
+		if err != nil || resp.StatusCode != 200 {
+			if err == nil {
+				resp.Body.Close()
+				err = fmt.Errorf("HTTP %d", resp.StatusCode)
+			}
+			log.Printf("Geo-IP Fetch failed for %s: %v. Using cache.", country, err)
+			allErrors = append(allErrors, fmt.Sprintf("%s: fetch failed (%v)", country, err))
 
-		cmd := exec.Command("sh", "-c", script)
-		if err := cmd.Run(); err != nil {
-			log.Printf("Geo-IP Помилка: не вдалося завантажити базу для %s: %v", country, err)
+			// Fallback to cache
+			f, cacheErr := os.Open(cacheFile)
+			if cacheErr != nil {
+				log.Printf("Geo-IP Cache failed for %s: %v.", country, cacheErr)
+				allErrors = append(allErrors, fmt.Sprintf("%s: cache failed (%v)", country, cacheErr))
+				success = false
+				continue
+			}
+			defer f.Close()
+			
+			// Load entire file into memory so we can use strings.NewReader
+			data, _ := io.ReadAll(f)
+			reader = strings.NewReader(string(data))
+		} else {
+			defer resp.Body.Close()
+			
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			os.WriteFile(cacheFile, bodyBytes, 0644)
+			reader = strings.NewReader(string(bodyBytes))
 		}
+
+		// Restore into tmp ipset
+		var restoreCmds []string
+		data, _ := io.ReadAll(reader)
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			ip := strings.TrimSpace(line)
+			if ip != "" && !strings.HasPrefix(ip, "#") {
+				restoreCmds = append(restoreCmds, fmt.Sprintf("add %s %s", tmpSetName, ip))
+			}
+		}
+
+		if len(restoreCmds) > 0 {
+			restoreData := strings.Join(restoreCmds, "\n") + "\n"
+			cmd := exec.Command("ipset", "restore")
+			cmd.Stdin = strings.NewReader(restoreData)
+			if err := cmd.Run(); err != nil {
+				log.Printf("Geo-IP ipset restore failed for %s: %v", country, err)
+				allErrors = append(allErrors, fmt.Sprintf("%s: ipset restore failed", country))
+				success = false
+			}
+		}
+	}
+
+	if success {
+		// Atomic swap
+		_ = exec.Command("ipset", "swap", tmpSetName, "p2ser_sanctions").Run()
+		nm.setGeoIPError("") // Clear error if completely successful
+	} else if len(allErrors) > 0 {
+		nm.setGeoIPError(strings.Join(allErrors, "; "))
 	}
 
 	// 2. Додаємо правила iptables на рівні ядра (DROP)
