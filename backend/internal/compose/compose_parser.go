@@ -168,6 +168,7 @@ func ParseComposeFile(projectName string, content []byte, envMap map[string]stri
 				Volumes:     volList,
 				UsernsRemap: svc.XUsernsRemap,
 				Status:      "Pending",
+				Project:     projectName,
 				App:         name,
 				Role:        "Active", // Пункт 6.2: Роль
 				DependsOn:   deps,     // 6.3: Зберігаємо залежності
@@ -189,8 +190,10 @@ func ParseComposeFile(projectName string, content []byte, envMap map[string]stri
 				Volumes:     volList,
 				UsernsRemap: svc.XUsernsRemap,
 				Status:      "Pending",
+				Project:     projectName,
 				App:         name,
-				Role:        "Standby", // Пункт 6.2: Роль резерву
+				Role:        "Standby", // Пункт 6.2: Роль
+				DependsOn:   deps,      // 6.3
 				Env:         envList,
 			}
 			pods = append(pods, pod)

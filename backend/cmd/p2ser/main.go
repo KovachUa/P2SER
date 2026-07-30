@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -138,6 +139,7 @@ func main() {
 	var joinAddr string
 	var vpsEndpoint string
 	var vpsPubKey string
+	var bootstrapExpect int
 	var vpsPrivKey string
 	var vpsTunnelIP string
 	var edgeMode bool
@@ -175,6 +177,7 @@ func main() {
 		fs.StringVar(&vpsTunnelIP, "ingress-ip", "10.100.0.2/24", "Внутрішня IP-адреса тунелю")
 		fs.BoolVar(&edgeMode, "edge", false, "Увімкнути профіль Gossip для нестабільних мереж")
 		fs.StringVar(&uiToken, "ui-token", "", "Окремий токен для UI (генерується автоматично, якщо порожній)")
+		fs.IntVar(&bootstrapExpect, "bootstrap-expect", 1, "Кількість вузлів для очікування перед bootstrap (лише для init)")
 
 		fs.Parse(os.Args[3:])
 
@@ -384,12 +387,35 @@ func main() {
 	// Пункт 2.1.1: Запуск Raft
 	// Використовуємо кастомний Listener замість звичайного TCP та передаємо прапорець bootstrap
 	if isBootstrap {
-		time.Sleep(2 * time.Second)
-		if list.NumMembers() > 1 || (wanList != nil && wanList.NumMembers() > 1) {
-			log.Println("Знайдено існуючий кластер. Перемикання в режим приєднання (start) замість bootstrap.")
-			isBootstrap = false
+		if bootstrapExpect > 1 {
+			log.Printf("Очікування %d вузлів (через mDNS/Gossip) перед bootstrap...", bootstrapExpect)
+			for list.NumMembers() < bootstrapExpect {
+				time.Sleep(200 * time.Millisecond) // Детерміністичне очікування, а не sleep 2s
+			}
+			
+			// C-6: Детерміністичний вибір єдиного bootstrap-лідера
+			members := list.Members()
+			var names []string
+			for _, m := range members {
+				names = append(names, m.Name)
+			}
+			sort.Strings(names)
+			
+			if names[0] != localNode.Name {
+				log.Printf("Детерміністичний вибір: вузол %s буде bootstrap-лідером. Ми перемикаємось у режим start (приєднання).", names[0])
+				isBootstrap = false
+			} else {
+				log.Printf("Цей вузол (%s) обрано bootstrap-лідером.", localNode.Name)
+			}
+		} else {
+			// Якщо bootstrap-expect = 1, просто запускаємося як bootstrap без очікування
+			if list.NumMembers() > 1 || (wanList != nil && wanList.NumMembers() > 1) {
+				log.Println("Знайдено існуючий кластер. Перемикання в режим приєднання (start) замість bootstrap.")
+				isBootstrap = false
+			}
 		}
 	}
+
 	raftNode, err := cluster.SetupRaftWithListener(localNode.Name, listener.Addr().String(), raftListener, nodeDataDir, fsm, isBootstrap)
 	if err != nil {
 		log.Fatalf("Помилка запуску Raft: %v", err)
@@ -483,15 +509,41 @@ func main() {
 
 	// 1.3.1 та 1.3.2: Транспорт метрик (Broadcasts + MessagePack)
 	go func() {
+		// 3.1.2: Оновлення оренди
 		for {
-			time.Sleep(5 * time.Second)
-			// Симулюємо збір метрик
+			time.Sleep(15 * time.Second)
+
+			// M-13: Зчитуємо реальні системні метрики замість захардкоджених
+			cpuUsage := 0.0
+			if b, err := os.ReadFile("/proc/loadavg"); err == nil {
+				parts := strings.Fields(string(b))
+				if len(parts) > 0 {
+					fmt.Sscanf(parts[0], "%f", &cpuUsage)
+				}
+			}
+			
+			ramFreeMB := 0
+			if b, err := os.ReadFile("/proc/meminfo"); err == nil {
+				lines := strings.Split(string(b), "\n")
+				for _, line := range lines {
+					if strings.HasPrefix(line, "MemAvailable:") {
+						var kb int
+						fmt.Sscanf(line, "MemAvailable: %d kB", &kb)
+						ramFreeMB = kb / 1024
+						break
+					}
+				}
+			}
+
 			metrics := network.NodeMetrics{
 				Node:     localNode.Name,
 				Version:  time.Now().UnixNano(), // 1.3.3: Кожна нова метрика має більшу версію (штамп часу)
-				CPUUsage: 15.5,
-				RAMFree:  1500,
+				CPUUsage: cpuUsage,
+				RAMFree:  ramFreeMB,
 			}
+
+			raftNode.Apply([]byte(`{"op":"heartbeat", "node_id":"`+localNode.Name+`"}`), 3*time.Second)
+
 			// Серіалізуємо у бінарний MessagePack (дуже компактно!)
 			b, err := msgpack.Marshal(&metrics)
 			if err == nil {

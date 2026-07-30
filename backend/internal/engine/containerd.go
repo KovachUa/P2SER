@@ -23,15 +23,19 @@ const namedVolumeDir = "/var/lib/p2ser/volumes"
 
 // resolveVolumeSrc резолвить named volume у абсолютний шлях на хості.
 // C-13: Забороняє вихід за межі дозволених директорій (Path Traversal / Host Compromise).
-func resolveVolumeSrc(src string) (string, error) {
+func resolveVolumeSrc(src string, pod *scheduler.Pod) (string, error) {
 	if filepath.IsAbs(src) {
 		// Забороняємо довільні абсолютні шляхи на хості (напр. /:/host)
 		// Дозволяємо лише якщо це вже всередині namedVolumeDir
 		cleanSrc := filepath.Clean(src)
 		if !strings.HasPrefix(cleanSrc, namedVolumeDir) {
-			// Якщо це тимчасова директорія збірки (з deploy), дозволяємо
+			// Якщо це тимчасова директорія, дозволяємо лише специфічну для цього проекту
 			if strings.HasPrefix(cleanSrc, os.TempDir()) {
-				return cleanSrc, nil
+				allowedTmp := filepath.Join(os.TempDir(), "p2ser-project-"+pod.Project)
+				if cleanSrc == allowedTmp || strings.HasPrefix(cleanSrc, allowedTmp+string(filepath.Separator)) {
+					return cleanSrc, nil
+				}
+				return "", fmt.Errorf("безпека: тимчасовий шлях %s заборонено (дозволено лише %s)", src, allowedTmp)
 			}
 			return "", fmt.Errorf("безпека: абсолютний шлях %s заборонено", src)
 		}
@@ -142,7 +146,7 @@ func (cm *ContainerManager) RunContainer(ctx context.Context, pod scheduler.Pod)
 		parts := strings.Split(v, ":")
 		if len(parts) >= 2 {
 			// Резолвимо named volumes у абсолютні шляхи (з перевіркою безпеки C-13)
-			src, err := resolveVolumeSrc(parts[0])
+			src, err := resolveVolumeSrc(parts[0], &pod)
 			if err != nil {
 				log.Printf("Volume: пропущено %s через порушення політики безпеки: %v", parts[0], err)
 				continue

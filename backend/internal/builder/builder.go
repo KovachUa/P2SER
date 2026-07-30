@@ -13,6 +13,7 @@ import (
 
 	"github.com/kovach/p2ser/internal/compose"
 	"github.com/kovach/p2ser/internal/scheduler"
+	"gopkg.in/yaml.v3"
 )
 
 // ParseEnvFile читає .env файл та повертає map зі змінними

@@ -2,7 +2,6 @@ package api
 
 import (
 	"archive/zip"
-	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -235,7 +234,7 @@ func (s *APIServer) HandleDeployGit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// H-4: Validate Git URL — allow only https/git schemes, block private IPs
-	host, ip, err := validateGitURL(reqData.URL)
+	err := validateGitURL(reqData.URL)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Invalid Git URL: %v", err), http.StatusBadRequest)
 		return
@@ -252,15 +251,8 @@ func (s *APIServer) HandleDeployGit(w http.ResponseWriter, r *http.Request) {
 	os.MkdirAll(tmpDir, 0755)
 	defer os.RemoveAll(tmpDir) // L-4: always clean up temp dirs
 
-	proxyURL, cleanup, err := runCloneProxy(host, ip)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Помилка створення proxy: %v", err), http.StatusInternalServerError)
-		return
-	}
-	defer cleanup()
-
 	// 1. Клонуємо репозиторій
-	args := []string{"-c", "http.proxy=" + proxyURL, "clone", "--depth=1"}
+	args := []string{"clone", "--depth=1"}
 	if reqData.Branch != "" {
 		args = append(args, "-b", reqData.Branch)
 	}
