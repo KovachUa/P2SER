@@ -23,6 +23,7 @@ type NodeMetrics struct {
 	Version  int64   `msgpack:"version"` // 1.3.3: Версіювання (Vector Clock / resourceVersion)
 	CPUUsage float64 `msgpack:"cpu_usage"`
 	RAMFree  int     `msgpack:"ram_free_mb"`
+	RAMTotal int     `msgpack:"ram_total_mb"`
 }
 
 type MyDelegate struct {

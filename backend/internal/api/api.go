@@ -399,7 +399,11 @@ func (s *APIServer) HandleNodes(w http.ResponseWriter, r *http.Request) {
 		if s.netManager != nil {
 			if metrics, ok := s.netManager.GetNodeMetrics(string(srv.ID)); ok {
 				cpuUsage = int(metrics.CPUUsage)
-				ramUsage = 100 - int(metrics.RAMFree*100/2048) // Approximation since we mock 2GB total in delegate
+				total := metrics.RAMTotal
+				if total <= 0 {
+					total = 2048 // Fallback
+				}
+				ramUsage = 100 - int(float64(metrics.RAMFree)*100.0/float64(total))
 				if ramUsage < 0 { ramUsage = 0 }
 				if ramUsage > 100 { ramUsage = 100 }
 			}

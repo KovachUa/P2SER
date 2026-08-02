@@ -14,12 +14,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/hashicorp/memberlist"
+	"github.com/hashicorp/raft"
 	"github.com/soheilhy/cmux"
 	"github.com/vmihailenco/msgpack/v5"
 
@@ -518,19 +520,33 @@ func main() {
 			if b, err := os.ReadFile("/proc/loadavg"); err == nil {
 				parts := strings.Fields(string(b))
 				if len(parts) > 0 {
-					fmt.Sscanf(parts[0], "%f", &cpuUsage)
+					var loadAvg float64
+					fmt.Sscanf(parts[0], "%f", &loadAvg)
+					// Ділимо loadavg на кількість ядер, щоб отримати %, але не більше 1.0, і переводимо у 0-100%
+					numCores := float64(runtime.NumCPU())
+					if numCores > 0 {
+						cpuUsage = (loadAvg / numCores) * 100.0
+						if cpuUsage > 100.0 {
+							cpuUsage = 100.0
+						}
+					}
 				}
 			}
 			
 			ramFreeMB := 0
+			ramTotalMB := 2048 // Дефолтне значення, якщо не вдалося зчитати
 			if b, err := os.ReadFile("/proc/meminfo"); err == nil {
 				lines := strings.Split(string(b), "\n")
 				for _, line := range lines {
+					if strings.HasPrefix(line, "MemTotal:") {
+						var kb int
+						fmt.Sscanf(line, "MemTotal: %d kB", &kb)
+						ramTotalMB = kb / 1024
+					}
 					if strings.HasPrefix(line, "MemAvailable:") {
 						var kb int
 						fmt.Sscanf(line, "MemAvailable: %d kB", &kb)
 						ramFreeMB = kb / 1024
-						break
 					}
 				}
 			}
@@ -540,10 +556,12 @@ func main() {
 				Version:  time.Now().UnixNano(), // 1.3.3: Кожна нова метрика має більшу версію (штамп часу)
 				CPUUsage: cpuUsage,
 				RAMFree:  ramFreeMB,
+				RAMTotal: ramTotalMB,
 			}
 
-			raftNode.Apply([]byte(`{"op":"heartbeat", "node_id":"`+localNode.Name+`"}`), 3*time.Second)
-
+			if raftNode.State() == raft.Leader {
+				raftNode.Apply([]byte(`{"op":"heartbeat", "node_id":"`+localNode.Name+`"}`), 3*time.Second)
+			}
 			// Серіалізуємо у бінарний MessagePack (дуже компактно!)
 			b, err := msgpack.Marshal(&metrics)
 			if err == nil {
